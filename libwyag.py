@@ -12,10 +12,10 @@ import libwyag
 libwyag.main()
 
 argparser = argparse.ArgumentParser(description="The stupid content tracker")
-argsubparsers = argparser.add_subparsers(title="Commands", dest="command")
-argsubparsers.required = True
+= argparser.add_subparsers(title="Commands", dest="command")
+.required = True
 
-argsp = argsubparsers.add_parser("init", help="Initialize a new, empty repository.")
+argsp = .add_parser("init", help="Initialize a new, empty repository.")
 argsp.add_argument("path",
                    metavar="directory",
                    nargs="?",
@@ -27,7 +27,7 @@ def cmd_init(args):
     repo_create(args.path)
 
 
-argsp = argsubparsers.add_parser('cat-file', help='Provide content of repository objects')
+argsp = .add_parser('cat-file', help='Provide content of repository objects')
 argsp.add_argument('type',
                    metavar='type',
                    choices=['blob', 'commit', 'tag', 'tree'],
@@ -47,7 +47,7 @@ def cat_file(repo, obj, fmt=None):
     sys.stdout.buffer.write(obj.serialize())
 
 
-argsp = argsubparsers.add_parser(
+argsp = .add_parser(
     'hash-object',
     help='Compute object ID and optionally creates a blob from a file')
 
@@ -142,6 +142,27 @@ def kvlm_parse(raw, start=0, dct=None):
     else:
         dct[key] = value
     return kvlm_parse(raw, start=end+1, dct=dct)
+
+
+def kvlm_serialize(kvlm):
+    ret = b''
+
+    # Output fileds
+    for k in kvlm.keys():
+        # Skip the message itself
+        if k == b'':
+            continue
+        val = kvlm[k]
+        # Normalize to a list
+        if type(val) != list:
+            val = [val]
+
+        for v in val:
+            ret += k + b' ' + (v.replace(b'\n', b'\n ')) + b'\n'
+
+    # Append message
+    ret += b'\n' + kvlm[b'']
+    return ret
 
 
 def main(argv=sys.argv[1:]):
@@ -392,9 +413,14 @@ class GitBlob(GitObject):
         self.blobdata = data
 
 
-class GitCommit(object):
-    def __init__(self):
-        print('hoge')
+class GitCommit(GitObject):
+    fmt = b'commit'
+
+    def deserialize(self, data):
+        self.kvlm = kvlm_parse(data)
+
+    def serialize(self):
+        return kvlm_serialize(self.kvlm)
 
 
 class GitTree(object):
