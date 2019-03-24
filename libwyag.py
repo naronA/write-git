@@ -12,10 +12,25 @@ import libwyag
 libwyag.main()
 
 argparser = argparse.ArgumentParser(description="The stupid content tracker")
-= argparser.add_subparsers(title="Commands", dest="command")
-.required = True
+argsubparsers = argparser.add_subparsers(title="Commands", dest="command")
+argsubparsers.required = True
 
-argsp = .add_parser("init", help="Initialize a new, empty repository.")
+argsp = argsubparsers.add_parser('tag', help='List and create tags')
+argsp.add_argument('-a', action='store_true', dest='create_tag_object', help='Whether to create a tag object')
+argsp.add_argument('name', nargs='?', help='The new tag\'s name')
+argsp.add_argument('object', default='HEAD', nargs='?', help='The object the new tag will point to')
+
+
+def cmd_tag(args):
+    repo = repo_find()
+    if args.name:
+        tag_create(args.mame, args.object, type='object' if args.create_tag_object else 'ref')
+    else:
+        refs = ref_list(repo)
+        show_ref(repo, refs['tags'], with_hash=False)
+
+
+argsp = argsubparsers.add_parser("init", help="Initialize a new, empty repository.")
 argsp.add_argument("path",
                    metavar="directory",
                    nargs="?",
@@ -27,7 +42,7 @@ def cmd_init(args):
     repo_create(args.path)
 
 
-argsp = .add_parser('cat-file', help='Provide content of repository objects')
+argsp = argsubparsers.add_parser('cat-file', help='Provide content of repository objects')
 argsp.add_argument('type',
                    metavar='type',
                    choices=['blob', 'commit', 'tag', 'tree'],
@@ -47,10 +62,8 @@ def cat_file(repo, obj, fmt=None):
     sys.stdout.buffer.write(obj.serialize())
 
 
-argsp = .add_parser(
-    'hash-object',
-    help='Compute object ID and optionally creates a blob from a file')
-
+argsp = argsubparsers.add_parser('hash-object',
+                                 help='Compute object ID and optionally creates a blob from a file')
 argsp.add_argument('-t',
                    metavar='type',
                    dest='type',
@@ -63,6 +76,251 @@ argsp.add_argument('-w',
                    help='Actually write the object into the database')
 argsp.add_argument('path',
                    help='Read object from <file>')
+
+
+argps = argsubparsers.add_parser('ls-tree', help='Pretty-print a tree object.')
+argsp.add_argument('object', help='The object to show.')
+
+
+def cmd_ls_tree(args):
+    repo = repo_find()
+    obj = object_read(repo, object_find(repo, args.object, fmt=b'tree'))
+
+    for item in obj.items:
+        print('{0} {1} {2}\t{3}'.format(
+            '0' * (6 - len(item.mode)) + item.mode.decode('ascii'),
+            # Git's ls-tree displays the type
+            # of the object pointed to. We can do that too:
+            object_read(repo, item.sha).fmt.decode('ascii'),
+            item.sha,
+            item.path.decode('ascii')))
+
+
+argsp = argsubparsers.add_parser('checkout', help='Checkout a commit inside of directory.')
+argsp.add_argument('commit', help='The commit or tree to checkout.')
+argsp.add_argument('path', help='The EMPTY directory to checkout on.')
+
+
+def tree_checkout(repo, tree, path):
+    for item in tree.items:
+        obj = object_read(repo, item.sha)
+        dest = os.path.join(path, item.path)
+
+        if obj.fmt == b'tree':
+            os.mkdir(dest)
+            tree_checkout(repo, obj, dest)
+        elif obj.fmt == b'blob':
+            with open(dest, 'wb') as f:
+                f.write(obj.blobdata)
+
+
+def cmd_checkout(args):
+    repo = repo_find()
+
+    obj = object_read(repo, object_find(repo, args.commit))
+
+    # If the object is a commit, we grab its tree
+    if obj.fmt == b'commit':
+        obj = object_read(repo, obj.kvlm[b'tree'].decode('ascii'))
+
+    # Verify that path is an empty directory
+    if os.path.exists(args.path):
+        if not os.path.isdir(args.path):
+            raise Exception('Not a directory {0}!'.format(args.path))
+        if not os.listdir(args.path):
+            raise Exception('Not empty {0}!'.format(args.path))
+    else:
+        os.makedirs(args.path)
+    tree_checkout(repo, obj, os.path.realpath(args.path).encode())
+
+
+argsp = argsubparsers.add_parser('show-ref', help='List references.')
+
+
+def show_ref(repo, refs, with_hash=True, prefix=''):
+    for k, v in refs.items():
+        if type(v) == str:
+            print('{0}{1}{2}'.format(
+                v + ' ' if with_hash else '',
+                prefix + '/' if prefix else '',
+                k
+            ))
+        else:
+            show_ref(repo,
+                     v,
+                     with_hash=with_hash,
+                     prefix='{0}{1}{2}'.format(prefix, '/' if prefix else '', k)
+                     )
+
+
+def cmd_show_ref(args):
+    repo = repo_find()
+    refs = ref_list(repo)
+    show_ref(repo, refs, prefix='refs')
+
+
+def ref_resolve(repo, ref):
+    with open(repo_file(repo, ref), 'r') as fp:
+        data = fp.read()[:-1]
+        # Drop final \n ^^^^^
+    if data.startswith('ref: '):
+        return ref_resolve(repo, data[5:])
+    else:
+        return data
+
+
+def ref_list(repo, path=None):
+    if not path:
+        path = repo_dir(repo, 'refs')
+    ret = collections.OrderedDict()
+    # Git shows refs sorted. Todo the same, we use
+    # an OrderedDict and sort the output of listdir
+    for f in sorted(os.listdir(path)):
+        can = os.path.join(path, f)
+        if os.path.isdir(can):
+            ret[f] = ref_list(repo, can)
+        else:
+            ret[f] = ref_resolve(repo, can)
+    return ret
+
+
+class GitTreeLeaf(object):
+    def __init__(self, mode, path, sha):
+        self.mode = mode
+        self.path = path
+        self.sha = sha
+
+
+def tree_parse_one(raw, start=0):
+    # Find the space terminator of the mode
+    x = raw.find(b' ', start)
+    assert(x-start == 5 or x-start == 6)
+
+    # Read the mode
+    mode = raw[start:x]
+
+    # Find the NULL terminator of the path
+    y = raw.find(b'\x00', x)
+    # and read the path
+    path = raw[x+1:y]
+
+    # Read the SHA and convert to an hex string
+    sha = hex(int.from_bytes(raw[y+1:y+21], 'big'))[2:]
+    return y + 21, GitTreeLeaf(mode, path, sha)
+
+
+def tree_parse(raw):
+    pos = 0
+    max = len(raw)
+    ret = list()
+    while pos < max:
+        pos, data = tree_parse_one(raw, pos)
+        ret.append(data)
+    return ret
+
+
+def tree_serialize(obj):
+    # @FIXME Add serialize
+    ret = b''
+    for i in obj.items:
+        ret += i.mode
+        ret += b' '
+        ret += i.path
+        ret += b'\00'
+        sha = int(i.sha, 16)
+        # @FIXME Does
+        ret += sha.to_bytes(20, byteorder='big')
+    return ret
+
+
+class GitObject(object):
+    repo = None
+
+    def __init__(self, repo, data=None):
+        self.repo = repo
+        if data is not None:
+            self.deserialize(data)
+
+    def serialize(self):
+        """This function MUST be implemented by subclasses.
+        It must read the object's contents from self.data, a byte string, and do
+        whatever it takes to convert it into a meaningful representation.
+        What exactly that means depend on each subclass."""
+        raise Exception('Unimplemented!')
+
+    def deserialize(self, data):
+        raise Exception('Unimplemented')
+
+
+class GitBlob(GitObject):
+    fmt = b'blob'
+    kvlm = None
+
+    def serialize(self):
+        return self.blobdata
+
+    def deserialize(self, data):
+        self.blobdata = data
+
+
+class GitCommit(GitObject):
+    fmt = b'commit'
+
+    def deserialize(self, data):
+        self.kvlm = kvlm_parse(data)
+
+    def serialize(self):
+        return kvlm_serialize(self.kvlm)
+
+
+class GitTree(object):
+    fmt = b'tree'
+    kvlm = None
+
+    def __init__(self, repo, data):
+        print('hoge')
+
+    def deserialize(self, data):
+        self.items = tree_parse(data)
+
+    def serialize(self):
+        return tree_serialize(self)
+
+
+class GitTag(GitCommit):
+    fmt = b'tag'
+
+    def __init__(self, repo, data):
+        print('hoge')
+
+
+class GitRepository(object):
+    """A git repository"""
+
+    worktree = None
+    gitdir = None
+    conf = None
+
+    def __init__(self, path, force=False):
+        self.worktree = path
+        self.gitdir = os.path.join(path, '.git')
+
+        if not (force or os.path.isdir(self.gitdir)):
+            raise Exception('Not a Git repository %s' % path)
+
+        # Read configuration file in .git/config
+        self.conf = configparser.ConfigParser()
+        cf = repo_file(self, 'config')
+
+        if cf and os.path.exists(cf):
+            self.conf.read([cf])
+        elif not force:
+            raise Exception('configuration file missing')
+
+        if not force:
+            vers = int(self.conf.get('core', 'repositoryformatversion'))
+        if vers != 0 and not force:
+            raise Exception('Unsupported repositoryformatversion %s' % vers)
 
 
 def object_hash(fd, fmt, repo=None):
@@ -81,6 +339,41 @@ def object_hash(fd, fmt, repo=None):
     else:
         raise Exception('Unknown type %s !' % fmt)
     return object_write(obj, repo)
+
+
+argsp = argsubparsers.add_parser('log', help='Display history of a given commit.')
+argsp.add_argument('commit', default='HEAD', nargs='?', help='Commit to start at.')
+
+
+def cmd_log(args):
+    repo = repo_find()
+
+    print('digraph wyaglog{')
+    log_graphviz(repo, object_find(repo, args.commit), set())
+    print('}')
+
+
+def log_graphviz(repo, sha, seen):
+    if sha in seen:
+        return
+    seen.add(sha)
+
+    commit = object_read(repo, sha)
+    assert (commit.fmt == b'commit')
+
+    if b'parent' not in commit.kvlm.keys():
+        # Base case: the initial commit.
+        return
+
+    parents = commit.kvlm[b'parent']
+
+    if type(parents) != list:
+        parents = [parents]
+
+    for p in parents:
+        p = p.decode('ascii')
+        print('c_{0} -> c_{1};'.format(sha, p))
+        log_graphviz(repo, p, seen)
 
 
 def cmd_hash_object(args):
@@ -283,18 +576,19 @@ def repo_dir(repo, *path, mkdir=False):
         return None
 
 
-def repo_path(repo, *path):
+def repo_path(repo, *path) -> str:
     """Compute path under repo's gitdir."""
     return os.path.join(repo.gitdir, *path)
 
 
-def repo_file(repo, *path, mkdir=False):
+def repo_file(repo: GitRepository, *path, mkdir=False) -> str:
     """Same as repo_path, but create dirname(*path) if absent. For
     example, repo_file(r, 'refs', 'remotes', 'origin', 'HEAD')
     will create .git/refs/remotes/origin."""
 
     if repo_dir(repo, *path[:-1], mkdir=mkdir):
         return repo_path(repo, *path)
+    return ''
 
 
 def object_write(obj, actually_write=True):
@@ -345,7 +639,7 @@ def object_read(repo, sha):
         elif fmt == b'tree':
             c = GitTree
         elif fmt == b'tag':
-            c = GitTAg
+            c = GitTag
         elif fmt == b'blob':
             c = GitBlob
         else:
@@ -353,81 +647,3 @@ def object_read(repo, sha):
 
         # Call constructor and retur object
         return c(repo, raw[y+1:])
-
-
-class GitRepository(object):
-    """A git repository"""
-
-    worktree = None
-    gitdir = None
-    conf = None
-
-    def __init__(self, path, force=False):
-        self.worktree = path
-        self.gitdir = os.path.join(path, '.git')
-
-        if not (force or os.path.isdir(self.gitdir)):
-            raise Exception('Not a Git repository %s' % path)
-
-        # Read configuration file in .git/config
-        self.conf = configparser.ConfigParser()
-        cf = repo_file(self, 'config')
-
-        if cf and os.path.exists(cf):
-            self.conf.read([cf])
-        elif not force:
-            raise Exception('configuration file missing')
-
-        if not force:
-            vers = int(self.conf.get('core', 'repositoryformatversion'))
-        if vers != 0 and not force:
-            raise Exception('Unsupported repositoryformatversion %s' % vers)
-
-
-class GitObject(object):
-    repo = None
-
-    def __init__(self, repo, data=None):
-        self.repo = repo
-        if data is not None:
-            self.deserialize(data)
-
-    def serialize(self):
-        """This function MUST be implemented by subclasses.
-        It must read the object's contents from self.data, a byte string, and do
-        whatever it takes to convert it into a meaningful representation.
-        What exactly that means depend on each subclass."""
-        raise Exception('Unimplemented!')
-
-    def deserialize(self):
-        raise Exception('Unimplemented')
-
-
-class GitBlob(GitObject):
-    fmt = b'blob'
-
-    def serialize(self):
-        return self.blobdata
-
-    def deserialize(self, data):
-        self.blobdata = data
-
-
-class GitCommit(GitObject):
-    fmt = b'commit'
-
-    def deserialize(self, data):
-        self.kvlm = kvlm_parse(data)
-
-    def serialize(self):
-        return kvlm_serialize(self.kvlm)
-
-
-class GitTree(object):
-    def __init__(self):
-        print('hoge')
-
-
-class GitTag(object):
-    def __init__(self):
-        print('hoge')
